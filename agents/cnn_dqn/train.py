@@ -4,7 +4,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import torch.optim as optim
-from collections import deque
+from collections import deque, namedtuple
 import wandb
 from tqdm import tqdm
 import math
@@ -12,15 +12,20 @@ import math
 from ..common.utils import VizDoomWrapper, evaluate_agent
 from .model import DQN, DuelingDQN
 
+# Define the transition tuple
+Transition = namedtuple('Transition', ('state', 'action', 'reward', 'next_state', 'done'))
+
 class ReplayBuffer:
     def __init__(self, capacity):
         self.buffer = deque(maxlen=capacity)
         
     def push(self, state, action, reward, next_state, done):
-        self.buffer.append((state, action, reward, next_state, done))
+        self.buffer.append(Transition(state, action, reward, next_state, done))
         
     def sample(self, batch_size):
-        return random.sample(self.buffer, batch_size)
+        transitions = random.sample(self.buffer, batch_size)
+        batch = Transition(*zip(*transitions))
+        return batch
         
     def __len__(self):
         return len(self.buffer)
@@ -33,16 +38,16 @@ class DQNAgent:
         
         # Initialize networks
         self.policy_net = DQN(
-            env.observation_space.shape[0],
-            env.action_space.n,
-            config.frame_stack,
-            config.resolution
+            state_dim=env.observation_space.shape[0],
+            n_actions=env.action_space.n,
+            frame_stack=config.frame_stack,
+            resolution=config.resolution
         ).to(self.device)
         self.target_net = DQN(
-            env.observation_space.shape[0],
-            env.action_space.n,
-            config.frame_stack,
-            config.resolution
+            state_dim=env.observation_space.shape[0],
+            n_actions=env.action_space.n,
+            frame_stack=config.frame_stack,
+            resolution=config.resolution
         ).to(self.device)
         self.target_net.load_state_dict(self.policy_net.state_dict())
         
@@ -81,15 +86,15 @@ class DQNAgent:
         if len(self.memory) < self.config.batch_size:
             return
             
-        transitions = self.memory.sample(self.config.batch_size)
-        batch = Transition(*zip(*transitions))
+        # Sample from memory
+        batch = self.memory.sample(self.config.batch_size)
         
         # Convert to tensors
-        state_batch = torch.cat(batch.state)
-        action_batch = torch.cat(batch.action)
-        reward_batch = torch.cat(batch.reward)
-        next_state_batch = torch.cat(batch.next_state)
-        done_batch = torch.cat(batch.done)
+        state_batch = torch.cat(batch.state).to(self.device)
+        action_batch = torch.tensor(batch.action, device=self.device).unsqueeze(1)
+        reward_batch = torch.cat(batch.reward).to(self.device)
+        next_state_batch = torch.cat(batch.next_state).to(self.device)
+        done_batch = torch.cat(batch.done).to(self.device).float()  # Convert to float
         
         # Compute Q(s_t, a)
         state_action_values = self.policy_net(state_batch).gather(1, action_batch)
@@ -131,8 +136,13 @@ class DQNAgent:
                 next_state = torch.FloatTensor(next_state).unsqueeze(0).to(self.device)
                 
                 # Store transition
-                self.memory.push(state, action, torch.tensor([reward], device=self.device), 
-                               next_state, torch.tensor([done], device=self.device))
+                self.memory.push(
+                    state,
+                    action.item(),
+                    torch.tensor([reward], device=self.device),
+                    next_state,
+                    torch.tensor([done], device=self.device)
+                )
                 
                 # Move to next state
                 state = next_state
@@ -184,13 +194,12 @@ def main():
             self.num_episodes = 1000
             self.max_steps = 1000
             self.batch_size = 32
+            self.memory_size = 100000
+            self.learning_rate = 1e-4
             self.gamma = 0.99
             self.epsilon_start = 1.0
             self.epsilon_end = 0.01
             self.epsilon_decay = 10000
-            self.learning_rate = 1e-4
-            self.replay_capacity = 100000
-            self.update_frequency = 4
             self.target_update = 1000
             self.max_grad_norm = 1.0
             self.save_frequency = 100
