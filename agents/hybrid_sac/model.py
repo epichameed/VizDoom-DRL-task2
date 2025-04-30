@@ -177,4 +177,48 @@ class HybridSACNetwork(nn.Module):
         return self.qf1(state, action), self.qf2(state, action)
         
     def q1_forward(self, state, action):
-        return self.qf1.q1_forward(state, action) 
+        return self.qf1.q1_forward(state, action)
+
+class HybridSAC(nn.Module):
+    def __init__(self, state_dim, n_actions, frame_stack=4, resolution=(84, 84)):
+        super(HybridSAC, self).__init__()
+        
+        # CNN for feature extraction
+        self.cnn = nn.Sequential(
+            nn.Conv2d(frame_stack, 32, kernel_size=8, stride=4),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=4, stride=2),
+            nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1),
+            nn.ReLU(),
+            nn.Flatten()
+        )
+        
+        # Calculate CNN output size
+        def conv2d_size_out(size, kernel_size, stride):
+            return (size - (kernel_size - 1) - 1) // stride + 1
+            
+        convw = conv2d_size_out(conv2d_size_out(conv2d_size_out(resolution[0], 8, 4), 4, 2), 3, 1)
+        convh = conv2d_size_out(conv2d_size_out(conv2d_size_out(resolution[1], 8, 4), 4, 2), 3, 1)
+        linear_input_size = convw * convh * 64
+        
+        # Policy head
+        self.policy = nn.Sequential(
+            nn.Linear(linear_input_size, 512),
+            nn.ReLU(),
+            nn.Linear(512, n_actions)
+        )
+        
+    def forward(self, x):
+        # Handle input shape
+        if len(x.shape) == 5:  # [batch_size, 1, frame_stack, H, W]
+            x = x.squeeze(1)  # Remove the extra dimension
+            
+        # Extract features
+        features = self.cnn(x)
+        
+        # Get action probabilities
+        action_logits = self.policy(features)
+        action_probs = F.softmax(action_logits, dim=-1)
+        
+        return action_probs 
