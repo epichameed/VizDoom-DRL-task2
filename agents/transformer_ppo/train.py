@@ -2,6 +2,7 @@ import os
 import random
 import numpy as np
 import torch
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 import wandb
@@ -20,9 +21,15 @@ class PPOMemory:
         self.dones = []
         
     def generate_batch(self):
-        return torch.tensor(self.states), torch.tensor(self.actions), \
-               torch.tensor(self.probs), torch.tensor(self.vals), \
-               torch.tensor(self.rewards), torch.tensor(self.dones)
+        # Stack tensors along the first dimension
+        states = torch.stack(self.states)
+        actions = torch.tensor(self.actions, dtype=torch.long)
+        probs = torch.tensor(self.probs, dtype=torch.float)
+        vals = torch.tensor(self.vals, dtype=torch.float)
+        rewards = torch.tensor(self.rewards, dtype=torch.float)
+        dones = torch.tensor(self.dones, dtype=torch.float)
+        
+        return states, actions, probs, vals, rewards, dones
                
     def clear_memory(self):
         self.states = []
@@ -62,8 +69,15 @@ class PPOAgent:
     def compute_gae(self, rewards, values, dones, gamma=0.99, lambda_=0.95):
         gae = 0
         returns = []
+        next_value = 0  # Initialize next_value for the last step
+        
         for step in reversed(range(len(rewards))):
-            delta = rewards[step] + gamma * values[step + 1] * (1 - dones[step]) - values[step]
+            if step == len(rewards) - 1:
+                next_value = 0  # No next value for the last step
+            else:
+                next_value = values[step + 1]
+                
+            delta = rewards[step] + gamma * next_value * (1 - dones[step]) - values[step]
             gae = delta + gamma * lambda_ * (1 - dones[step]) * gae
             returns.insert(0, gae + values[step])
         return returns
@@ -137,7 +151,12 @@ class PPOAgent:
         # Compute returns and advantages
         returns = self.compute_gae(rewards, vals, dones)
         returns = torch.tensor(returns).to(self.config.device)
-        advantages = returns - vals[:-1]
+        
+        # Ensure tensors have the same size
+        if len(returns) > len(vals):
+            returns = returns[:-1]  # Remove the last element to match vals size
+            
+        advantages = returns - vals
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
         
         # Update policy for n epochs

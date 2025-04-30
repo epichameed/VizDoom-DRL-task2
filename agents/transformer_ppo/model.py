@@ -25,7 +25,8 @@ class TransformerEncoder(nn.Module):
             d_model=d_model,
             nhead=nhead,
             dim_feedforward=dim_feedforward,
-            dropout=dropout
+            dropout=dropout,
+            batch_first=True
         )
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         
@@ -57,6 +58,10 @@ class VisionTransformer(nn.Module):
         self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
         
     def forward(self, x):
+        # Handle input shape
+        if len(x.shape) == 5:  # [batch_size, 1, frame_stack, H, W]
+            x = x.squeeze(1)  # Remove the extra dimension
+        
         # Patch embedding
         x = self.patch_embedding(x)  # [batch_size, d_model, H/patch_size, W/patch_size]
         x = x.flatten(2).transpose(1, 2)  # [batch_size, num_patches, d_model]

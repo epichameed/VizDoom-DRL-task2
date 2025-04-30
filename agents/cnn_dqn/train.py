@@ -7,6 +7,7 @@ import torch.optim as optim
 from collections import deque
 import wandb
 from tqdm import tqdm
+import math
 
 from ..common.utils import VizDoomWrapper, evaluate_agent
 from .model import DQN, DuelingDQN
@@ -28,56 +29,80 @@ class DQNAgent:
     def __init__(self, env, config):
         self.env = env
         self.config = config
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
         # Initialize networks
-        self.policy_net = DuelingDQN(env.action_space.n, config.frame_stack).to(config.device)
-        self.target_net = DuelingDQN(env.action_space.n, config.frame_stack).to(config.device)
+        self.policy_net = DQN(
+            env.observation_space.shape[0],
+            env.action_space.n,
+            config.frame_stack,
+            config.resolution
+        ).to(self.device)
+        self.target_net = DQN(
+            env.observation_space.shape[0],
+            env.action_space.n,
+            config.frame_stack,
+            config.resolution
+        ).to(self.device)
         self.target_net.load_state_dict(self.policy_net.state_dict())
         
         # Initialize optimizer
         self.optimizer = optim.Adam(self.policy_net.parameters(), lr=config.learning_rate)
         
-        # Initialize replay buffer
-        self.memory = ReplayBuffer(config.replay_capacity)
+        # Initialize memory
+        self.memory = ReplayBuffer(config.memory_size)
         
         # Training state
         self.steps_done = 0
         self.episode_rewards = []
         
-    def select_action(self, state, epsilon):
+    def select_action(self, state, epsilon=0.0):
         if random.random() < epsilon:
-            return torch.tensor([[self.env.action_space.sample()]], device=self.config.device)
+            return torch.tensor([[self.env.action_space.sample()]], device=self.device, dtype=torch.long)
         
         with torch.no_grad():
             return self.policy_net(state).max(1)[1].view(1, 1)
             
+    def predict(self, state, deterministic=True):
+        """Predict action for evaluation"""
+        with torch.no_grad():
+            if not isinstance(state, torch.Tensor):
+                state = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+            if len(state.shape) == 4:  # Add batch dimension if missing
+                state = state.unsqueeze(0)
+            q_values = self.policy_net(state)
+            if deterministic:
+                action = q_values.max(1)[1].item()
+            else:
+                action = torch.multinomial(F.softmax(q_values, dim=1), 1).item()
+            return action, None  # Return action and None for compatibility with other agents
+        
     def optimize_model(self):
         if len(self.memory) < self.config.batch_size:
             return
             
-        # Sample from replay buffer
         transitions = self.memory.sample(self.config.batch_size)
-        batch = list(zip(*transitions))
+        batch = Transition(*zip(*transitions))
         
         # Convert to tensors
-        state_batch = torch.cat(batch[0])
-        action_batch = torch.cat(batch[1])
-        reward_batch = torch.cat(batch[2])
-        next_state_batch = torch.cat(batch[3])
-        done_batch = torch.cat(batch[4])
+        state_batch = torch.cat(batch.state)
+        action_batch = torch.cat(batch.action)
+        reward_batch = torch.cat(batch.reward)
+        next_state_batch = torch.cat(batch.next_state)
+        done_batch = torch.cat(batch.done)
         
         # Compute Q(s_t, a)
         state_action_values = self.policy_net(state_batch).gather(1, action_batch)
         
         # Compute V(s_{t+1})
         with torch.no_grad():
-            next_state_values = self.target_net(next_state_batch).max(1)[0]
-            next_state_values[done_batch] = 0.0
-            expected_state_action_values = (next_state_values * self.config.gamma) + reward_batch
-            
-        # Compute loss and optimize
+            next_state_values = self.target_net(next_state_batch).max(1)[0].detach()
+            expected_state_action_values = (next_state_values * (1 - done_batch) * self.config.gamma) + reward_batch
+        
+        # Compute loss
         loss = F.smooth_l1_loss(state_action_values, expected_state_action_values.unsqueeze(1))
         
+        # Optimize
         self.optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), self.config.max_grad_norm)
@@ -91,23 +116,23 @@ class DQNAgent:
         
         for episode in tqdm(range(self.config.num_episodes)):
             state, _ = self.env.reset()
-            state = torch.FloatTensor(state).unsqueeze(0).to(self.config.device)
+            state = torch.FloatTensor(state).unsqueeze(0).to(self.device)
             episode_reward = 0
             
             for t in range(self.config.max_steps):
                 # Select action
                 epsilon = self.config.epsilon_end + (self.config.epsilon_start - self.config.epsilon_end) * \
-                         np.exp(-1. * self.steps_done / self.config.epsilon_decay)
+                         math.exp(-1. * self.steps_done / self.config.epsilon_decay)
                 action = self.select_action(state, epsilon)
                 
                 # Take action
                 next_state, reward, terminated, truncated, _ = self.env.step(action.item())
                 done = terminated or truncated
-                next_state = torch.FloatTensor(next_state).unsqueeze(0).to(self.config.device)
+                next_state = torch.FloatTensor(next_state).unsqueeze(0).to(self.device)
                 
                 # Store transition
-                self.memory.push(state, action, torch.tensor([reward], device=self.config.device),
-                               next_state, torch.tensor([done], device=self.config.device))
+                self.memory.push(state, action, torch.tensor([reward], device=self.device), 
+                               next_state, torch.tensor([done], device=self.device))
                 
                 # Move to next state
                 state = next_state
@@ -115,9 +140,7 @@ class DQNAgent:
                 self.steps_done += 1
                 
                 # Optimize model
-                if self.steps_done % self.config.update_frequency == 0:
-                    loss = self.optimize_model()
-                    wandb.log({"loss": loss}, step=self.steps_done)
+                loss = self.optimize_model()
                 
                 # Update target network
                 if self.steps_done % self.config.target_update == 0:
@@ -131,18 +154,19 @@ class DQNAgent:
             wandb.log({
                 "episode_reward": episode_reward,
                 "epsilon": epsilon,
+                "loss": loss if 'loss' in locals() else 0,
                 "steps": self.steps_done
             }, step=self.steps_done)
             
             # Save model periodically
             if episode % self.config.save_frequency == 0:
                 torch.save({
-                    'policy_net_state_dict': self.policy_net.state_dict(),
-                    'target_net_state_dict': self.target_net.state_dict(),
+                    'policy_state_dict': self.policy_net.state_dict(),
+                    'target_state_dict': self.target_net.state_dict(),
                     'optimizer_state_dict': self.optimizer.state_dict(),
                     'steps_done': self.steps_done,
                     'episode_rewards': self.episode_rewards
-                }, f"checkpoints/cnn_dqn_episode_{episode}.pt")
+                }, f"checkpoints/dqn_episode_{episode}.pt")
                 
         wandb.finish()
 
