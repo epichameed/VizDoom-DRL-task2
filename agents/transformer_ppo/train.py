@@ -43,6 +43,7 @@ class PPOAgent:
     def __init__(self, env, config):
         self.env = env
         self.config = config
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
         # Initialize actor-critic network
         self.policy = ActorCritic(
@@ -66,6 +67,24 @@ class PPOAgent:
         self.steps_done = 0
         self.episode_rewards = []
         
+    def select_action(self, state, evaluate=False):
+        with torch.no_grad():
+            if not isinstance(state, torch.Tensor):
+                state = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+            if len(state.shape) == 4:  # Add batch dimension if missing
+                state = state.unsqueeze(0)
+                
+            action_probs, value = self.policy(state)
+            if evaluate:
+                action = torch.argmax(action_probs, dim=1)
+            else:
+                action = torch.multinomial(action_probs, 1)
+            return action.item(), action_probs[0, action.item()].item(), value.item()
+            
+    def predict(self, state, deterministic=True):
+        """Predict action for evaluation"""
+        return self.select_action(state, evaluate=deterministic)[0], None
+        
     def compute_gae(self, rewards, values, dones, gamma=0.99, lambda_=0.95):
         gae = 0
         returns = []
@@ -88,17 +107,17 @@ class PPOAgent:
         
         for episode in tqdm(range(self.config.num_episodes)):
             state, _ = self.env.reset()
-            state = torch.FloatTensor(state).unsqueeze(0).to(self.config.device)
+            state = torch.FloatTensor(state).unsqueeze(0).to(self.device)
             episode_reward = 0
             
             for t in range(self.config.max_steps):
                 # Select action
-                action, prob, val = self.policy.get_action(state)
+                action, prob, val = self.select_action(state)
                 
                 # Take action
                 next_state, reward, terminated, truncated, _ = self.env.step(action)
                 done = terminated or truncated
-                next_state = torch.FloatTensor(next_state).unsqueeze(0).to(self.config.device)
+                next_state = torch.FloatTensor(next_state).unsqueeze(0).to(self.device)
                 
                 # Store transition
                 self.memory.states.append(state.cpu())

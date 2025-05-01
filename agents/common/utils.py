@@ -3,6 +3,7 @@ import cv2
 import gymnasium as gym
 from gymnasium import spaces
 from vizdoom import DoomGame, Mode, ScreenFormat, ScreenResolution
+from collections import deque
 
 class VizDoomWrapper(gym.Env):
     def __init__(self, scenario_path, frame_skip=4, frame_stack=4, resolution=(84, 84)):
@@ -22,59 +23,64 @@ class VizDoomWrapper(gym.Env):
         self.frame_stack = frame_stack
         self.resolution = resolution
         
-        # Define action space
-        self.action_space = spaces.Discrete(self.game.get_available_buttons_size())
+        # Initialize frame buffer
+        self.frames = deque(maxlen=frame_stack)
+        for _ in range(frame_stack):
+            self.frames.append(np.zeros(resolution, dtype=np.uint8))
+            
+        # Get action space
+        self.actions = np.identity(self.game.get_available_buttons_size(), dtype=np.uint8)
+        self.action_space = spaces.Discrete(len(self.actions))
         
-        # Define observation space
+        # Get observation space
         self.observation_space = spaces.Box(
-            low=0, high=255,
-            shape=(frame_stack, resolution[0], resolution[1]),
+            low=0,
+            high=255,
+            shape=(frame_stack, *resolution),
             dtype=np.uint8
         )
         
-        # Initialize frame buffer
-        self.frame_buffer = np.zeros((frame_stack, *resolution), dtype=np.uint8)
-        
-    def preprocess_frame(self, frame):
-        """Preprocess a single frame"""
-        # Resize
-        frame = cv2.resize(frame, self.resolution)
-        # Normalize
-        frame = frame.astype(np.float32) / 255.0
-        return frame
+    def seed(self, seed=None):
+        """Set the seed for the environment"""
+        if seed is not None:
+            self.game.set_seed(seed)
+        return [seed]
         
     def reset(self, seed=None):
         self.game.new_episode()
-        frame = self.game.get_state().screen_buffer
-        frame = self.preprocess_frame(frame)
+        state = self.game.get_state()
+        frame = self.preprocess(state.screen_buffer)
         
-        # Initialize frame buffer
-        self.frame_buffer = np.stack([frame] * self.frame_stack)
-        return self.frame_buffer, {}
+        # Reset frame buffer
+        self.frames.clear()
+        for _ in range(self.frame_stack):
+            self.frames.append(frame)
+            
+        return np.stack(self.frames), {}
         
     def step(self, action):
-        reward = 0
-        # Convert action to list format expected by ViZDoom
-        action_list = [0] * self.game.get_available_buttons_size()
-        action_list[action] = 1
+        reward = self.game.make_action(self.actions[action], self.frame_skip)
+        done = self.game.is_episode_finished()
         
-        for _ in range(self.frame_skip):
-            reward += self.game.make_action(action_list)
-            if self.game.is_episode_finished():
-                break
-                
-        if self.game.is_episode_finished():
-            return self.frame_buffer, reward, True, True, {}
+        if not done:
+            state = self.game.get_state()
+            frame = self.preprocess(state.screen_buffer)
+            self.frames.append(frame)
+        else:
+            frame = np.zeros(self.resolution, dtype=np.uint8)
+            self.frames.append(frame)
             
-        # Get new frame
-        frame = self.game.get_state().screen_buffer
-        frame = self.preprocess_frame(frame)
+        return np.stack(self.frames), reward, done, done, {}
         
-        # Update frame buffer
-        self.frame_buffer = np.roll(self.frame_buffer, -1, axis=0)
-        self.frame_buffer[-1] = frame
+    def preprocess(self, frame):
+        # Convert to grayscale if needed
+        if len(frame.shape) == 3:
+            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+            
+        # Resize
+        frame = cv2.resize(frame, self.resolution, interpolation=cv2.INTER_AREA)
         
-        return self.frame_buffer, reward, False, False, {}
+        return frame
         
     def close(self):
         self.game.close()

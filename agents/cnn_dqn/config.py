@@ -1,3 +1,5 @@
+import torch
+
 class Config:
     def __init__(self):
         # Environment settings
