@@ -108,7 +108,24 @@ class ActorCritic(nn.Module):
         
     def forward(self, x):
         features = self.vision_transformer(x)
-        action_probs = F.softmax(self.actor(features), dim=-1)
+        
+        # Calculate logits first
+        action_logits = self.actor(features)
+        
+        # Apply softmax with more numerical stability
+        # First subtract the maximum value for numerical stability
+        action_logits_max, _ = torch.max(action_logits, dim=1, keepdim=True)
+        action_logits_stable = action_logits - action_logits_max
+        
+        # Then apply softmax
+        action_probs = F.softmax(action_logits_stable, dim=-1)
+        
+        # Ensure no zeros (for log stability)
+        action_probs = torch.clamp(action_probs, min=1e-6)
+        
+        # Re-normalize to ensure sum to 1
+        action_probs = action_probs / action_probs.sum(dim=1, keepdim=True)
+        
         value = self.critic(features)
         return action_probs, value
         
@@ -116,4 +133,4 @@ class ActorCritic(nn.Module):
         with torch.no_grad():
             action_probs, value = self.forward(x)
             action = torch.multinomial(action_probs, 1)
-            return action.item(), action_probs[0, action.item()].item(), value.item() 
+            return action.item(), action_probs[0, action.item()].item(), value.item()

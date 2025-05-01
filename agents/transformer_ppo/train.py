@@ -75,10 +75,24 @@ class PPOAgent:
                 state = state.unsqueeze(0)
                 
             action_probs, value = self.policy(state)
+            
+            # Add validation to ensure valid probability distribution
+            # Check for NaN or Inf values
+            if torch.isnan(action_probs).any() or torch.isinf(action_probs).any():
+                # Replace with uniform distribution as fallback
+                action_probs = torch.ones_like(action_probs) / action_probs.shape[1]
+            
+            # Ensure all values are positive
+            action_probs = torch.clamp(action_probs, min=1e-6)
+            
+            # Re-normalize to ensure sum to 1
+            action_probs = action_probs / action_probs.sum(dim=1, keepdim=True)
+            
             if evaluate:
                 action = torch.argmax(action_probs, dim=1)
             else:
                 action = torch.multinomial(action_probs, 1)
+            
             return action.item(), action_probs[0, action.item()].item(), value.item()
             
     def predict(self, state, deterministic=True):
@@ -182,10 +196,22 @@ class PPOAgent:
         for _ in range(self.config.n_epochs):
             # Get new action probabilities and values
             new_probs, new_vals = self.policy(states)
-            new_probs = new_probs.gather(1, actions.unsqueeze(1)).squeeze(1)
             
-            # Compute ratios
-            ratios = torch.exp(torch.log(new_probs) - torch.log(old_probs))
+            # Add validation to ensure valid probability distribution
+            if torch.isnan(new_probs).any() or torch.isinf(new_probs).any():
+                # Skip this update iteration if probabilities are invalid
+                continue
+                
+            # Ensure all values are positive and normalized
+            new_probs = torch.clamp(new_probs, min=1e-6)
+            new_probs = new_probs / new_probs.sum(dim=1, keepdim=True)
+            
+            # Get probabilities for the actions that were taken
+            action_probs = new_probs.gather(1, actions.unsqueeze(1)).squeeze(1)
+            
+            # Compute ratios with numerical stability
+            # Add small epsilon to prevent division by zero or log of zero
+            ratios = torch.exp(torch.log(action_probs + 1e-10) - torch.log(old_probs + 1e-10))
             
             # Compute surrogate losses
             surr1 = ratios * advantages
@@ -195,8 +221,8 @@ class PPOAgent:
             # Compute value loss
             value_loss = F.mse_loss(new_vals.squeeze(), returns)
             
-            # Compute entropy loss
-            entropy_loss = -(new_probs * torch.log(new_probs + 1e-8)).mean()
+            # Compute entropy loss with numerical stability
+            entropy_loss = -(new_probs * torch.log(new_probs + 1e-10)).sum(dim=1).mean()
             
             # Total loss
             loss = policy_loss + self.config.value_coef * value_loss - self.config.entropy_coef * entropy_loss
@@ -269,4 +295,4 @@ def main():
     env.close()
 
 if __name__ == "__main__":
-    main() 
+    main()
